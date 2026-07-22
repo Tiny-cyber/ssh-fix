@@ -24,123 +24,137 @@ if (-not $isAdmin) {
 }
 
 # ============================================================
-# 第 1 步: 安装 OpenSSH Server (三重保险, 带超时)
+# 第 1 步: 安装 OpenSSH Server
+# 策略: 绕开 Windows Servicing Stack (Add-WindowsCapability/DISM),
+#        公司电脑上十台有八台卡在那个蓝色进度条 "Operation Running"
 # ============================================================
 Write-Host "[1/6] 检查 OpenSSH Server..." -ForegroundColor Yellow
 
 $sshdInstalled = $false
-$installTimeout = 60
 
-# 先检查 sshd 服务是否已存在 (可能已预装或上次部分安装成功)
+# --- 检查 1: sshd 服务是否已存在 ---
 $existingSshd = Get-Service sshd -ErrorAction SilentlyContinue
 if ($existingSshd) {
-    Write-Host "  OpenSSH Server 已安装 (服务状态: $($existingSshd.Status))" -ForegroundColor Green
+    Write-Host "  sshd 服务已存在 (状态: $($existingSshd.Status))" -ForegroundColor Green
     $sshdInstalled = $true
 }
 
-# 方法 A: 本地离线安装 (不走网络, Win10 1809+/Win11 组件商店通常自带)
+# --- 检查 2: sshd.exe 是否已在磁盘上 (Win10/11 常有但没注册服务) ---
 if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 A (本地离线安装, 不走网络)..." -ForegroundColor Yellow
-    try {
-        $result = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -LimitAccess -ErrorAction Stop
-        if ($result.RestartNeeded) {
-            Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
-        } else {
-            Write-Host "  已从本地组件商店安装 OpenSSH Server" -ForegroundColor Green
+    Write-Host "  搜索磁盘上的 sshd.exe..." -ForegroundColor Gray
+    $searchPaths = @(
+        "C:\Windows\System32\OpenSSH\sshd.exe",
+        "C:\Program Files\OpenSSH\sshd.exe",
+        "C:\Program Files\OpenSSH-Win64\sshd.exe",
+        "$env:SystemRoot\System32\OpenSSH\sshd.exe"
+    )
+    $sshdExe = $null
+    foreach ($p in $searchPaths) {
+        if (Test-Path $p) {
+            $sshdExe = $p
+            break
         }
-        $sshdInstalled = $true
-    } catch {
-        Write-Host "  方法 A (本地离线) 失败: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    if ($sshdExe) {
+        Write-Host "  找到 sshd.exe: $sshdExe" -ForegroundColor Green
+        $sshdDir = Split-Path $sshdExe -Parent
+        $installScript = Join-Path $sshdDir "install-sshd.ps1"
+        if (Test-Path $installScript) {
+            Write-Host "  正在注册 sshd 服务..." -ForegroundColor Gray
+            & powershell.exe -ExecutionPolicy Bypass -File $installScript 2>&1 | Out-Null
+        } else {
+            # 手动注册服务
+            Write-Host "  手动注册 sshd 服务..." -ForegroundColor Gray
+            & sc.exe create sshd binPath="$sshdExe" start=auto DisplayName="OpenSSH SSH Server" 2>&1 | Out-Null
+        }
+        $svc = Get-Service sshd -ErrorAction SilentlyContinue
+        if ($svc) {
+            Write-Host "  sshd 服务注册成功" -ForegroundColor Green
+            $sshdInstalled = $true
+        } else {
+            Write-Host "  服务注册失败, 继续尝试其他方法..." -ForegroundColor Red
+        }
+    } else {
+        Write-Host "  磁盘上未找到 sshd.exe" -ForegroundColor Gray
     }
 }
 
-# 方法 A2: DISM 本地离线安装
+# --- 方法 A: 用 curl.exe 从 GitHub 下载 (Win10 1803+ 自带, 和 PowerShell 用不同的网络栈) ---
 if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 A2 (DISM 本地离线)..." -ForegroundColor Yellow
-    try {
-        $dismOutput = & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /LimitAccess 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  DISM 本地离线安装成功" -ForegroundColor Green
-            $sshdInstalled = $true
-        } else {
-            Write-Host "  DISM 本地离线失败 (exit $LASTEXITCODE)" -ForegroundColor Red
-        }
-    } catch {
-        Write-Host "  DISM 本地离线失败: $_" -ForegroundColor Red
-    }
-}
+    Write-Host "  尝试方法 A (curl.exe 下载)..." -ForegroundColor Yellow
+    $curlExe = "$env:SystemRoot\System32\curl.exe"
+    if (Test-Path $curlExe) {
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "Win64" } else { "Win32" }
+        $zipPath = "$env:TEMP\OpenSSH-Download.zip"
+        $extractPath = "$env:TEMP\OpenSSH-Extract"
+        $installPath = "C:\Program Files\OpenSSH"
+        $downloaded = $false
 
-# 方法 B: Get-WindowsCapability 联网安装 (60秒超时)
-if (-not $sshdInstalled) {
-    try {
-        $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 2>$null
-        if ($cap -and $cap.State -eq "Installed") {
-            Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
-            $sshdInstalled = $true
-        } elseif ($cap) {
-            Write-Host "  尝试方法 B (联网安装, ${installTimeout}秒超时)..." -ForegroundColor Yellow
-            $job = Start-Job -ScriptBlock {
-                Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
-            }
-            $finished = $job | Wait-Job -Timeout $installTimeout
-            if ($finished) {
-                $result = Receive-Job $job -ErrorAction Stop
-                Remove-Job $job -Force
-                if ($result.RestartNeeded) {
-                    Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
-                } else {
-                    Write-Host "  已安装 OpenSSH Server" -ForegroundColor Green
+        $downloadUrls = @(
+            "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-${arch}.zip"
+        )
+
+        foreach ($url in $downloadUrls) {
+            if ($downloaded) { break }
+            Write-Host "  正在下载 OpenSSH-${arch}.zip..." -ForegroundColor Gray
+            try {
+                # curl.exe: -L 跟随重定向, -k 跳过证书验证, --connect-timeout 连接超时, --max-time 总超时
+                & $curlExe -L -k --connect-timeout 15 --max-time 120 -o $zipPath $url 2>&1 | Out-Null
+                if ((Test-Path $zipPath) -and (Get-Item $zipPath).Length -gt 100000) {
+                    Write-Host "  下载成功" -ForegroundColor Green
+                    $downloaded = $true
                 }
-                $sshdInstalled = $true
-            } else {
-                Write-Host "  方法 B 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
-                Stop-Job $job -ErrorAction SilentlyContinue
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Host "  curl 下载失败: $_" -ForegroundColor Gray
             }
         }
-    } catch {
-        Write-Host "  方法 B (联网安装) 失败: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
 
-# 方法 B2: DISM 联网安装 (60秒超时)
-if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 B2 (DISM 联网, ${installTimeout}秒超时)..." -ForegroundColor Yellow
-    try {
-        $job = Start-Job -ScriptBlock {
-            & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 2>&1
-            $LASTEXITCODE
-        }
-        $finished = $job | Wait-Job -Timeout $installTimeout
-        if ($finished) {
-            $output = Receive-Job $job
-            Remove-Job $job -Force
-            $exitCode = $output[-1]
-            if ($exitCode -eq 0) {
-                Write-Host "  DISM 联网安装成功" -ForegroundColor Green
-                $sshdInstalled = $true
-            } else {
-                Write-Host "  DISM 联网失败 (exit $exitCode)" -ForegroundColor Red
+        if ($downloaded) {
+            try {
+                if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                Write-Host "  正在解压..." -ForegroundColor Gray
+                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                $sshFolder = Get-ChildItem -Path $extractPath -Directory | Select-Object -First 1
+                if (-not $sshFolder) { throw "解压后找不到 OpenSSH 文件夹" }
+
+                Stop-Service sshd -Force -ErrorAction SilentlyContinue
+                if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force }
+                Copy-Item -Path $sshFolder.FullName -Destination $installPath -Recurse -Force
+
+                $installScript = Join-Path $installPath "install-sshd.ps1"
+                if (Test-Path $installScript) {
+                    Write-Host "  正在注册 sshd 服务..." -ForegroundColor Gray
+                    & powershell.exe -ExecutionPolicy Bypass -File $installScript
+                }
+                if (Get-Service sshd -ErrorAction SilentlyContinue) {
+                    Write-Host "  OpenSSH 安装成功" -ForegroundColor Green
+                    $sshdInstalled = $true
+                }
+
+                $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+                if ($machinePath -notlike "*$installPath*") {
+                    [Environment]::SetEnvironmentVariable("Path", "$machinePath;$installPath", "Machine")
+                    $env:Path = "$env:Path;$installPath"
+                }
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Host "  解压/安装失败: $($_.Exception.Message)" -ForegroundColor Red
             }
         } else {
-            Write-Host "  方法 B2 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
-            Stop-Job $job -ErrorAction SilentlyContinue
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
+            Write-Host "  curl 下载失败 (网络不通)" -ForegroundColor Red
         }
-    } catch {
-        Write-Host "  DISM 联网失败: $_" -ForegroundColor Red
+    } else {
+        Write-Host "  curl.exe 不存在, 跳过" -ForegroundColor Gray
     }
 }
 
-# 方法 C: 从 GitHub 下载 Win32-OpenSSH 手动安装
+# --- 方法 B: PowerShell 下载 (和 curl 用不同的 TLS 栈, 作为互补) ---
 if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 C (GitHub 下载 Win32-OpenSSH)..." -ForegroundColor Yellow
+    Write-Host "  尝试方法 B (PowerShell 下载)..." -ForegroundColor Yellow
     try {
-        # 强制 TLS 1.2 + 跳过证书验证 (公司网络中间人代理常导致证书错误)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
-        try {
-            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        } catch {}
+        try { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
 
         $arch = if ([Environment]::Is64BitOperatingSystem) { "Win64" } else { "Win32" }
         $zipPath = "$env:TEMP\OpenSSH-Download.zip"
@@ -148,99 +162,116 @@ if (-not $sshdInstalled) {
         $installPath = "C:\Program Files\OpenSSH"
         $downloaded = $false
 
-        # 先尝试直接用已知 URL 下载 (跳过 API 查询, 减少一次网络请求)
-        $directUrls = @(
-            "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-${arch}.zip",
-            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/49609581/OpenSSH-${arch}.zip"
-        )
-        foreach ($url in $directUrls) {
-            if ($downloaded) { break }
+        # 直接下载
+        $url = "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-${arch}.zip"
+        try {
+            Write-Host "  正在下载 OpenSSH-${arch}.zip..." -ForegroundColor Gray
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "PowerShell")
+            $wc.DownloadFile($url, $zipPath)
+            if ((Test-Path $zipPath) -and (Get-Item $zipPath).Length -gt 100000) {
+                $downloaded = $true
+            }
+        } catch {
+            Write-Host "  WebClient 下载失败: $($_.Exception.Message)" -ForegroundColor Gray
+        }
+
+        # 回退: API 查询
+        if (-not $downloaded) {
             try {
-                Write-Host "  正在下载 OpenSSH-${arch}.zip..." -ForegroundColor Gray
-                $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add("User-Agent", "PowerShell")
-                $wc.DownloadFile($url, $zipPath)
-                if ((Test-Path $zipPath) -and (Get-Item $zipPath).Length -gt 100000) {
-                    $downloaded = $true
+                Write-Host "  尝试通过 API 查询..." -ForegroundColor Gray
+                $release = Invoke-RestMethod -Uri "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest" -TimeoutSec 15
+                $asset = $release.assets | Where-Object { $_.name -like "OpenSSH-${arch}*.zip" -and $_.name -notlike "*debug*" } | Select-Object -First 1
+                if ($asset) {
+                    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
+                    if ((Test-Path $zipPath) -and (Get-Item $zipPath).Length -gt 100000) { $downloaded = $true }
                 }
             } catch {
-                Write-Host "  直接下载失败, 尝试其他方式..." -ForegroundColor Gray
+                Write-Host "  API 下载也失败: $($_.Exception.Message)" -ForegroundColor Gray
             }
         }
 
-        # 回退: 通过 API 查询最新版本再下载
-        if (-not $downloaded) {
-            $releasesUrl = "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest"
-            Write-Host "  正在通过 API 查询最新版本..." -ForegroundColor Gray
-            $release = Invoke-RestMethod -Uri $releasesUrl -TimeoutSec 30
-            $asset = $release.assets | Where-Object { $_.name -like "OpenSSH-${arch}*.zip" -and $_.name -notlike "*debug*" } | Select-Object -First 1
-            if (-not $asset) { throw "找不到匹配 $arch 的下载文件" }
-            $zipUrl = $asset.browser_download_url
-            Write-Host "  正在下载 $($asset.name)..." -ForegroundColor Gray
-            Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
-        }
+        if ($downloaded) {
+            if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+            Write-Host "  正在解压..." -ForegroundColor Gray
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            $sshFolder = Get-ChildItem -Path $extractPath -Directory | Select-Object -First 1
+            if (-not $sshFolder) { throw "解压后找不到 OpenSSH 文件夹" }
 
-        # 清理旧的解压目录
-        if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+            Stop-Service sshd -Force -ErrorAction SilentlyContinue
+            if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force }
+            Copy-Item -Path $sshFolder.FullName -Destination $installPath -Recurse -Force
 
-        Write-Host "  正在解压..." -ForegroundColor Gray
-        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-        # 找到解压后的目录 (通常是 OpenSSH-Win64 或 OpenSSH-Win32)
-        $sshFolder = Get-ChildItem -Path $extractPath -Directory | Select-Object -First 1
-        if (-not $sshFolder) { throw "解压后找不到 OpenSSH 文件夹" }
-
-        # 如果已有旧安装, 先停服务
-        Stop-Service sshd -Force -ErrorAction SilentlyContinue
-
-        # 复制到安装目录
-        if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force }
-        Copy-Item -Path $sshFolder.FullName -Destination $installPath -Recurse -Force
-
-        # 运行安装脚本
-        $installScript = Join-Path $installPath "install-sshd.ps1"
-        if (Test-Path $installScript) {
-            Write-Host "  正在注册 sshd 服务..." -ForegroundColor Gray
-            & powershell.exe -ExecutionPolicy Bypass -File $installScript
-            if ($LASTEXITCODE -eq 0 -or (Get-Service sshd -ErrorAction SilentlyContinue)) {
-                Write-Host "  Win32-OpenSSH 安装成功" -ForegroundColor Green
+            $installScript = Join-Path $installPath "install-sshd.ps1"
+            if (Test-Path $installScript) {
+                Write-Host "  正在注册 sshd 服务..." -ForegroundColor Gray
+                & powershell.exe -ExecutionPolicy Bypass -File $installScript
+            }
+            if (Get-Service sshd -ErrorAction SilentlyContinue) {
+                Write-Host "  OpenSSH 安装成功" -ForegroundColor Green
                 $sshdInstalled = $true
-            } else {
-                Write-Host "  install-sshd.ps1 执行失败" -ForegroundColor Red
             }
+
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($machinePath -notlike "*$installPath*") {
+                [Environment]::SetEnvironmentVariable("Path", "$machinePath;$installPath", "Machine")
+                $env:Path = "$env:Path;$installPath"
+            }
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+            Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
         } else {
-            throw "找不到 install-sshd.ps1"
+            Write-Host "  方法 B 失败 (网络不通)" -ForegroundColor Red
         }
-
-        # 把安装目录加入 PATH
-        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-        if ($machinePath -notlike "*$installPath*") {
-            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$installPath", "Machine")
-            $env:Path = "$env:Path;$installPath"
-            Write-Host "  已添加到系统 PATH" -ForegroundColor Green
-        }
-
-        # 清理临时文件
-        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-
     } catch {
-        Write-Host "  方法 C 失败: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  方法 B 失败: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# 最终检查 sshd 服务是否存在
+# --- 方法 C: Windows 组件安装 (最后手段, 30秒超时, 公司电脑大概率会卡) ---
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 C (Windows 组件安装, 30秒超时)..." -ForegroundColor Yellow
+    Write-Host "  [提示] 如果出现蓝色进度条, 请等待最多30秒会自动跳过" -ForegroundColor Gray
+    $job = Start-Job -ScriptBlock {
+        try {
+            $r = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
+            return @{ Success = $true; RestartNeeded = $r.RestartNeeded }
+        } catch {
+            return @{ Success = $false; Error = $_.Exception.Message }
+        }
+    }
+    $finished = $job | Wait-Job -Timeout 30
+    if ($finished) {
+        $result = Receive-Job $job
+        Remove-Job $job -Force
+        if ($result.Success) {
+            if ($result.RestartNeeded) {
+                Write-Host "  [警告] 安装完成, 但可能需要重启" -ForegroundColor Red
+            } else {
+                Write-Host "  已安装 OpenSSH Server" -ForegroundColor Green
+            }
+            $sshdInstalled = $true
+        } else {
+            Write-Host "  方法 C 失败: $($result.Error)" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "  方法 C 超时 (30秒), 跳过" -ForegroundColor Red
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# --- 最终检查 ---
 $sshdService = Get-Service sshd -ErrorAction SilentlyContinue
 if (-not $sshdService) {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Red
-    Write-Host "  [失败] OpenSSH Server 三种方法都装不上" -ForegroundColor Red
+    Write-Host "  [失败] OpenSSH Server 安装不上" -ForegroundColor Red
     Write-Host "========================================" -ForegroundColor Red
     Write-Host ""
-    Write-Host "  可能原因:" -ForegroundColor Yellow
-    Write-Host "    1. Windows 版本太旧 (需要 Win10 1809+ 或 Server 2019+)" -ForegroundColor Yellow
-    Write-Host "    2. Windows Update 服务被禁用" -ForegroundColor Yellow
-    Write-Host "    3. 网络无法连接 GitHub" -ForegroundColor Yellow
+    Write-Host "  所有方法都失败了, 可能原因:" -ForegroundColor Yellow
+    Write-Host "    1. 公司网络封锁了 GitHub" -ForegroundColor Yellow
+    Write-Host "    2. Windows 组件服务被公司 IT 锁死" -ForegroundColor Yellow
+    Write-Host "    3. 需要让 IT 手动安装 OpenSSH Server" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  当前 Windows 版本:" -ForegroundColor Gray
     Write-Host "  $([Environment]::OSVersion.VersionString)" -ForegroundColor White
@@ -257,7 +288,6 @@ if (-not $sshdService) {
 # ============================================================
 Write-Host "[2/6] 修复 sshd_config..." -ForegroundColor Yellow
 
-# 确保 C:\ProgramData\ssh 目录存在, 先启动一次 sshd 让它生成默认配置
 $configPath = "C:\ProgramData\ssh\sshd_config"
 if (-not (Test-Path $configPath)) {
     Write-Host "  sshd_config 不存在, 先启动 sshd 生成默认配置..." -ForegroundColor Gray
@@ -268,14 +298,12 @@ if (-not (Test-Path $configPath)) {
 
 try {
     if (Test-Path $configPath) {
-        # 备份原始配置
         $backupPath = "C:\ProgramData\ssh\sshd_config.bak.$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item $configPath $backupPath -Force
         Write-Host "  已备份原配置到 $backupPath" -ForegroundColor Gray
 
         $config = Get-Content $configPath -Raw
 
-        # 启用 PubkeyAuthentication
         if ($config -match "#\s*PubkeyAuthentication") {
             $config = $config -replace "#\s*PubkeyAuthentication\s+yes", "PubkeyAuthentication yes"
             Write-Host "  已启用 PubkeyAuthentication" -ForegroundColor Green
@@ -286,8 +314,6 @@ try {
             Write-Host "  PubkeyAuthentication 已启用" -ForegroundColor Green
         }
 
-        # [关键] 注释掉 Match Group administrators 块
-        # 这是 Windows SSH 密钥认证失败的头号原因
         $matchChanged = $false
         if ($config -match "(?m)^Match\s+Group\s+administrators") {
             $config = $config -replace "(?m)^(Match\s+Group\s+administrators)", "# `$1 (commented out by ssh-fix)"
@@ -330,7 +356,6 @@ try {
     $pubKeys = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmtCGpspbS4qb632U7cUlO0UJXqnZGJZMySVYtV1gPI tinypity@TinyPitydeMac-mini.local"
 }
 
-# 写入用户目录 ~/.ssh/authorized_keys
 $authKeys = "$env:USERPROFILE\.ssh\authorized_keys"
 try {
     $sshDir = "$env:USERPROFILE\.ssh"
@@ -341,7 +366,6 @@ try {
     Write-Host "  [错误] 写入用户 authorized_keys 失败: $_" -ForegroundColor Red
 }
 
-# 同时写入 ProgramData (管理员覆盖路径, 作为后备)
 $adminKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
 try {
     $sshProgramData = "C:\ProgramData\ssh"
@@ -357,7 +381,6 @@ try {
 # ============================================================
 Write-Host "[4/6] 修复文件权限..." -ForegroundColor Yellow
 try {
-    # 用户 authorized_keys 权限
     if (Test-Path $authKeys) {
         icacls $authKeys /inheritance:r /grant "$($env:USERNAME):(F)" /grant "SYSTEM:(F)" | Out-Null
         Write-Host "  已设置 authorized_keys 权限" -ForegroundColor Green
@@ -367,7 +390,6 @@ try {
 }
 
 try {
-    # administrators_authorized_keys 权限 (只允许 SYSTEM 和 Administrators)
     if (Test-Path $adminKeys) {
         icacls $adminKeys /inheritance:r /grant "SYSTEM:(F)" /grant "Administrators:(F)" | Out-Null
         Write-Host "  已设置 administrators_authorized_keys 权限" -ForegroundColor Green
@@ -387,7 +409,6 @@ try {
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
         Write-Host "  已创建防火墙放行规则 (TCP 22)" -ForegroundColor Green
     } else {
-        # 确保规则是启用状态
         if ($rule.Enabled -ne "True") {
             Enable-NetFirewallRule -Name "OpenSSH-Server-In-TCP"
             Write-Host "  已启用防火墙放行规则" -ForegroundColor Green
@@ -426,7 +447,7 @@ try {
 }
 
 # ============================================================
-# 最终验证: 确认 sshd 真的在跑
+# 最终验证
 # ============================================================
 $finalCheck = Get-Service sshd -ErrorAction SilentlyContinue
 if (-not $finalCheck -or $finalCheck.Status -ne "Running") {
@@ -447,7 +468,6 @@ if (-not $finalCheck -or $finalCheck.Status -ne "Running") {
 Write-Host ""
 Write-Host ""
 
-# 获取 Tailscale IP
 $tailscaleIP = $null
 $tailscalePaths = @(
     "C:\Program Files\Tailscale\tailscale.exe",
@@ -462,14 +482,12 @@ foreach ($tsPath in $tailscalePaths) {
         } catch {}
     }
 }
-# 如果 CLI 没找到, 从网卡找 100.x.x.x
 if (-not $tailscaleIP) {
     try {
         $tailscaleIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like "100.*" } | Select-Object -First 1).IPAddress
     } catch {}
 }
 
-# 获取局域网 IP (排除 loopback、Tailscale、虚拟网卡)
 $lanIP = $null
 try {
     $lanIP = (Get-NetIPAddress -AddressFamily IPv4 |
