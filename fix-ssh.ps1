@@ -24,42 +24,76 @@ if (-not $isAdmin) {
 }
 
 # ============================================================
-# 第 1 步: 安装 OpenSSH Server (三重保险)
+# 第 1 步: 安装 OpenSSH Server (三重保险, 带超时)
 # ============================================================
 Write-Host "[1/6] 检查 OpenSSH Server..." -ForegroundColor Yellow
 
 $sshdInstalled = $false
+$installTimeout = 60
 
-# 方法 A: Get-WindowsCapability (标准方式)
-try {
-    $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 2>$null
-    if ($cap -and $cap.State -eq "Installed") {
-        Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
-        $sshdInstalled = $true
-    } elseif ($cap) {
-        Write-Host "  正在通过 Windows 功能安装 OpenSSH Server..." -ForegroundColor Yellow
-        $result = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
-        if ($result.RestartNeeded) {
-            Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
-        } else {
-            Write-Host "  已安装 OpenSSH Server" -ForegroundColor Green
-        }
-        $sshdInstalled = $true
-    }
-} catch {
-    Write-Host "  方法 A (WindowsCapability) 失败: $($_.Exception.Message)" -ForegroundColor Red
+# 先检查 sshd 服务是否已存在 (可能已预装或上次部分安装成功)
+$existingSshd = Get-Service sshd -ErrorAction SilentlyContinue
+if ($existingSshd) {
+    Write-Host "  OpenSSH Server 已安装 (服务状态: $($existingSshd.Status))" -ForegroundColor Green
+    $sshdInstalled = $true
 }
 
-# 方法 B: DISM 命令行
+# 方法 A: Get-WindowsCapability (标准方式, 60秒超时)
 if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 B (DISM)..." -ForegroundColor Yellow
     try {
-        $dismOutput = & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "  DISM 安装成功" -ForegroundColor Green
+        $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 2>$null
+        if ($cap -and $cap.State -eq "Installed") {
+            Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
             $sshdInstalled = $true
+        } elseif ($cap) {
+            Write-Host "  正在通过 Windows 功能安装 OpenSSH Server (${installTimeout}秒超时)..." -ForegroundColor Yellow
+            $job = Start-Job -ScriptBlock {
+                Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
+            }
+            $finished = $job | Wait-Job -Timeout $installTimeout
+            if ($finished) {
+                $result = Receive-Job $job -ErrorAction Stop
+                Remove-Job $job -Force
+                if ($result.RestartNeeded) {
+                    Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
+                } else {
+                    Write-Host "  已安装 OpenSSH Server" -ForegroundColor Green
+                }
+                $sshdInstalled = $true
+            } else {
+                Write-Host "  方法 A 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
+                Stop-Job $job -ErrorAction SilentlyContinue
+                Remove-Job $job -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Host "  方法 A (WindowsCapability) 失败: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# 方法 B: DISM 命令行 (60秒超时)
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 B (DISM, ${installTimeout}秒超时)..." -ForegroundColor Yellow
+    try {
+        $job = Start-Job -ScriptBlock {
+            & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 2>&1
+            $LASTEXITCODE
+        }
+        $finished = $job | Wait-Job -Timeout $installTimeout
+        if ($finished) {
+            $output = Receive-Job $job
+            Remove-Job $job -Force
+            $exitCode = $output[-1]
+            if ($exitCode -eq 0) {
+                Write-Host "  DISM 安装成功" -ForegroundColor Green
+                $sshdInstalled = $true
+            } else {
+                Write-Host "  DISM 失败 (exit $exitCode)" -ForegroundColor Red
+            }
         } else {
-            Write-Host "  DISM 失败 (exit $LASTEXITCODE)" -ForegroundColor Red
+            Write-Host "  方法 B 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
         }
     } catch {
         Write-Host "  DISM 失败: $_" -ForegroundColor Red
