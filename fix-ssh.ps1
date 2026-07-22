@@ -38,7 +38,39 @@ if ($existingSshd) {
     $sshdInstalled = $true
 }
 
-# 方法 A: Get-WindowsCapability (标准方式, 60秒超时)
+# 方法 A: 本地离线安装 (不走网络, Win10 1809+/Win11 组件商店通常自带)
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 A (本地离线安装, 不走网络)..." -ForegroundColor Yellow
+    try {
+        $result = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -LimitAccess -ErrorAction Stop
+        if ($result.RestartNeeded) {
+            Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
+        } else {
+            Write-Host "  已从本地组件商店安装 OpenSSH Server" -ForegroundColor Green
+        }
+        $sshdInstalled = $true
+    } catch {
+        Write-Host "  方法 A (本地离线) 失败: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# 方法 A2: DISM 本地离线安装
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 A2 (DISM 本地离线)..." -ForegroundColor Yellow
+    try {
+        $dismOutput = & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /LimitAccess 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  DISM 本地离线安装成功" -ForegroundColor Green
+            $sshdInstalled = $true
+        } else {
+            Write-Host "  DISM 本地离线失败 (exit $LASTEXITCODE)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  DISM 本地离线失败: $_" -ForegroundColor Red
+    }
+}
+
+# 方法 B: Get-WindowsCapability 联网安装 (60秒超时)
 if (-not $sshdInstalled) {
     try {
         $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 2>$null
@@ -46,7 +78,7 @@ if (-not $sshdInstalled) {
             Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
             $sshdInstalled = $true
         } elseif ($cap) {
-            Write-Host "  正在通过 Windows 功能安装 OpenSSH Server (${installTimeout}秒超时)..." -ForegroundColor Yellow
+            Write-Host "  尝试方法 B (联网安装, ${installTimeout}秒超时)..." -ForegroundColor Yellow
             $job = Start-Job -ScriptBlock {
                 Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
             }
@@ -61,19 +93,19 @@ if (-not $sshdInstalled) {
                 }
                 $sshdInstalled = $true
             } else {
-                Write-Host "  方法 A 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
+                Write-Host "  方法 B 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
                 Stop-Job $job -ErrorAction SilentlyContinue
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
             }
         }
     } catch {
-        Write-Host "  方法 A (WindowsCapability) 失败: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  方法 B (联网安装) 失败: $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
-# 方法 B: DISM 命令行 (60秒超时)
+# 方法 B2: DISM 联网安装 (60秒超时)
 if (-not $sshdInstalled) {
-    Write-Host "  尝试方法 B (DISM, ${installTimeout}秒超时)..." -ForegroundColor Yellow
+    Write-Host "  尝试方法 B2 (DISM 联网, ${installTimeout}秒超时)..." -ForegroundColor Yellow
     try {
         $job = Start-Job -ScriptBlock {
             & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 2>&1
@@ -85,18 +117,18 @@ if (-not $sshdInstalled) {
             Remove-Job $job -Force
             $exitCode = $output[-1]
             if ($exitCode -eq 0) {
-                Write-Host "  DISM 安装成功" -ForegroundColor Green
+                Write-Host "  DISM 联网安装成功" -ForegroundColor Green
                 $sshdInstalled = $true
             } else {
-                Write-Host "  DISM 失败 (exit $exitCode)" -ForegroundColor Red
+                Write-Host "  DISM 联网失败 (exit $exitCode)" -ForegroundColor Red
             }
         } else {
-            Write-Host "  方法 B 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
+            Write-Host "  方法 B2 超时 (${installTimeout}秒), 跳过..." -ForegroundColor Red
             Stop-Job $job -ErrorAction SilentlyContinue
             Remove-Job $job -Force -ErrorAction SilentlyContinue
         }
     } catch {
-        Write-Host "  DISM 失败: $_" -ForegroundColor Red
+        Write-Host "  DISM 联网失败: $_" -ForegroundColor Red
     }
 }
 
@@ -104,26 +136,49 @@ if (-not $sshdInstalled) {
 if (-not $sshdInstalled) {
     Write-Host "  尝试方法 C (GitHub 下载 Win32-OpenSSH)..." -ForegroundColor Yellow
     try {
-        # 检测架构
+        # 强制 TLS 1.2 + 跳过证书验证 (公司网络中间人代理常导致证书错误)
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+        try {
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        } catch {}
+
         $arch = if ([Environment]::Is64BitOperatingSystem) { "Win64" } else { "Win32" }
-        $releasesUrl = "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest"
-
-        Write-Host "  正在查询最新版本..." -ForegroundColor Gray
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $release = Invoke-RestMethod -Uri $releasesUrl -TimeoutSec 30
-        $asset = $release.assets | Where-Object { $_.name -like "OpenSSH-${arch}*.zip" -and $_.name -notlike "*debug*" } | Select-Object -First 1
-
-        if (-not $asset) {
-            throw "找不到匹配 $arch 的下载文件"
-        }
-
-        $zipUrl = $asset.browser_download_url
         $zipPath = "$env:TEMP\OpenSSH-Download.zip"
         $extractPath = "$env:TEMP\OpenSSH-Extract"
         $installPath = "C:\Program Files\OpenSSH"
+        $downloaded = $false
 
-        Write-Host "  正在下载 $($asset.name)..." -ForegroundColor Gray
-        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
+        # 先尝试直接用已知 URL 下载 (跳过 API 查询, 减少一次网络请求)
+        $directUrls = @(
+            "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-${arch}.zip",
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/49609581/OpenSSH-${arch}.zip"
+        )
+        foreach ($url in $directUrls) {
+            if ($downloaded) { break }
+            try {
+                Write-Host "  正在下载 OpenSSH-${arch}.zip..." -ForegroundColor Gray
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add("User-Agent", "PowerShell")
+                $wc.DownloadFile($url, $zipPath)
+                if ((Test-Path $zipPath) -and (Get-Item $zipPath).Length -gt 100000) {
+                    $downloaded = $true
+                }
+            } catch {
+                Write-Host "  直接下载失败, 尝试其他方式..." -ForegroundColor Gray
+            }
+        }
+
+        # 回退: 通过 API 查询最新版本再下载
+        if (-not $downloaded) {
+            $releasesUrl = "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest"
+            Write-Host "  正在通过 API 查询最新版本..." -ForegroundColor Gray
+            $release = Invoke-RestMethod -Uri $releasesUrl -TimeoutSec 30
+            $asset = $release.assets | Where-Object { $_.name -like "OpenSSH-${arch}*.zip" -and $_.name -notlike "*debug*" } | Select-Object -First 1
+            if (-not $asset) { throw "找不到匹配 $arch 的下载文件" }
+            $zipUrl = $asset.browser_download_url
+            Write-Host "  正在下载 $($asset.name)..." -ForegroundColor Gray
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
+        }
 
         # 清理旧的解压目录
         if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
