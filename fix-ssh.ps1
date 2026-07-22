@@ -24,32 +24,159 @@ if (-not $isAdmin) {
 }
 
 # ============================================================
-# 第 1 步: 安装 OpenSSH Server
+# 第 1 步: 安装 OpenSSH Server (三重保险)
 # ============================================================
 Write-Host "[1/6] 检查 OpenSSH Server..." -ForegroundColor Yellow
+
+$sshdInstalled = $false
+
+# 方法 A: Get-WindowsCapability (标准方式)
 try {
-    $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
-    if ($cap.State -ne "Installed") {
-        Write-Host "  正在安装 OpenSSH Server (可能需要几分钟)..." -ForegroundColor Yellow
-        $result = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+    $cap = Get-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 2>$null
+    if ($cap -and $cap.State -eq "Installed") {
+        Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
+        $sshdInstalled = $true
+    } elseif ($cap) {
+        Write-Host "  正在通过 Windows 功能安装 OpenSSH Server..." -ForegroundColor Yellow
+        $result = Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
         if ($result.RestartNeeded) {
             Write-Host "  [警告] 安装完成, 但可能需要重启电脑后才能生效" -ForegroundColor Red
         } else {
             Write-Host "  已安装 OpenSSH Server" -ForegroundColor Green
         }
-    } else {
-        Write-Host "  OpenSSH Server 已安装" -ForegroundColor Green
+        $sshdInstalled = $true
     }
 } catch {
-    Write-Host "  [错误] 安装 OpenSSH Server 失败: $_" -ForegroundColor Red
-    Write-Host "  尝试继续..." -ForegroundColor Yellow
+    Write-Host "  方法 A (WindowsCapability) 失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# 方法 B: DISM 命令行
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 B (DISM)..." -ForegroundColor Yellow
+    try {
+        $dismOutput = & dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  DISM 安装成功" -ForegroundColor Green
+            $sshdInstalled = $true
+        } else {
+            Write-Host "  DISM 失败 (exit $LASTEXITCODE)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  DISM 失败: $_" -ForegroundColor Red
+    }
+}
+
+# 方法 C: 从 GitHub 下载 Win32-OpenSSH 手动安装
+if (-not $sshdInstalled) {
+    Write-Host "  尝试方法 C (GitHub 下载 Win32-OpenSSH)..." -ForegroundColor Yellow
+    try {
+        # 检测架构
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "Win64" } else { "Win32" }
+        $releasesUrl = "https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest"
+
+        Write-Host "  正在查询最新版本..." -ForegroundColor Gray
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri $releasesUrl -TimeoutSec 30
+        $asset = $release.assets | Where-Object { $_.name -like "OpenSSH-${arch}*.zip" -and $_.name -notlike "*debug*" } | Select-Object -First 1
+
+        if (-not $asset) {
+            throw "找不到匹配 $arch 的下载文件"
+        }
+
+        $zipUrl = $asset.browser_download_url
+        $zipPath = "$env:TEMP\OpenSSH-Download.zip"
+        $extractPath = "$env:TEMP\OpenSSH-Extract"
+        $installPath = "C:\Program Files\OpenSSH"
+
+        Write-Host "  正在下载 $($asset.name)..." -ForegroundColor Gray
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
+
+        # 清理旧的解压目录
+        if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+
+        Write-Host "  正在解压..." -ForegroundColor Gray
+        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+        # 找到解压后的目录 (通常是 OpenSSH-Win64 或 OpenSSH-Win32)
+        $sshFolder = Get-ChildItem -Path $extractPath -Directory | Select-Object -First 1
+        if (-not $sshFolder) { throw "解压后找不到 OpenSSH 文件夹" }
+
+        # 如果已有旧安装, 先停服务
+        Stop-Service sshd -Force -ErrorAction SilentlyContinue
+
+        # 复制到安装目录
+        if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force }
+        Copy-Item -Path $sshFolder.FullName -Destination $installPath -Recurse -Force
+
+        # 运行安装脚本
+        $installScript = Join-Path $installPath "install-sshd.ps1"
+        if (Test-Path $installScript) {
+            Write-Host "  正在注册 sshd 服务..." -ForegroundColor Gray
+            & powershell.exe -ExecutionPolicy Bypass -File $installScript
+            if ($LASTEXITCODE -eq 0 -or (Get-Service sshd -ErrorAction SilentlyContinue)) {
+                Write-Host "  Win32-OpenSSH 安装成功" -ForegroundColor Green
+                $sshdInstalled = $true
+            } else {
+                Write-Host "  install-sshd.ps1 执行失败" -ForegroundColor Red
+            }
+        } else {
+            throw "找不到 install-sshd.ps1"
+        }
+
+        # 把安装目录加入 PATH
+        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($machinePath -notlike "*$installPath*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$installPath", "Machine")
+            $env:Path = "$env:Path;$installPath"
+            Write-Host "  已添加到系统 PATH" -ForegroundColor Green
+        }
+
+        # 清理临时文件
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+
+    } catch {
+        Write-Host "  方法 C 失败: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# 最终检查 sshd 服务是否存在
+$sshdService = Get-Service sshd -ErrorAction SilentlyContinue
+if (-not $sshdService) {
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "  [失败] OpenSSH Server 三种方法都装不上" -ForegroundColor Red
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  可能原因:" -ForegroundColor Yellow
+    Write-Host "    1. Windows 版本太旧 (需要 Win10 1809+ 或 Server 2019+)" -ForegroundColor Yellow
+    Write-Host "    2. Windows Update 服务被禁用" -ForegroundColor Yellow
+    Write-Host "    3. 网络无法连接 GitHub" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  当前 Windows 版本:" -ForegroundColor Gray
+    Write-Host "  $([Environment]::OSVersion.VersionString)" -ForegroundColor White
+    Write-Host "  $(Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption)" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  请把以上信息截图发回" -ForegroundColor Yellow
+    Write-Host ""
+    pause
+    exit 1
 }
 
 # ============================================================
 # 第 2 步: 修复 sshd_config
 # ============================================================
 Write-Host "[2/6] 修复 sshd_config..." -ForegroundColor Yellow
+
+# 确保 C:\ProgramData\ssh 目录存在, 先启动一次 sshd 让它生成默认配置
 $configPath = "C:\ProgramData\ssh\sshd_config"
+if (-not (Test-Path $configPath)) {
+    Write-Host "  sshd_config 不存在, 先启动 sshd 生成默认配置..." -ForegroundColor Gray
+    Start-Service sshd -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Stop-Service sshd -Force -ErrorAction SilentlyContinue
+}
+
 try {
     if (Test-Path $configPath) {
         # 备份原始配置
@@ -91,7 +218,7 @@ try {
         Set-Content -Path $configPath -Value $config -Force -NoNewline
         Write-Host "  配置已保存" -ForegroundColor Green
     } else {
-        Write-Host "  sshd_config 尚不存在, 首次启动 sshd 后会自动创建" -ForegroundColor Yellow
+        Write-Host "  [警告] sshd_config 仍不存在, 跳过配置修复" -ForegroundColor Red
     }
 } catch {
     Write-Host "  [错误] 修复 sshd_config 失败: $_" -ForegroundColor Red
@@ -115,9 +242,9 @@ try {
 }
 
 # 写入用户目录 ~/.ssh/authorized_keys
+$authKeys = "$env:USERPROFILE\.ssh\authorized_keys"
 try {
     $sshDir = "$env:USERPROFILE\.ssh"
-    $authKeys = "$sshDir\authorized_keys"
     if (-not (Test-Path $sshDir)) { mkdir $sshDir -Force | Out-Null }
     Set-Content -Path $authKeys -Value $pubKeys -Force
     Write-Host "  已写入 $authKeys" -ForegroundColor Green
@@ -126,8 +253,8 @@ try {
 }
 
 # 同时写入 ProgramData (管理员覆盖路径, 作为后备)
+$adminKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
 try {
-    $adminKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
     $sshProgramData = "C:\ProgramData\ssh"
     if (-not (Test-Path $sshProgramData)) { mkdir $sshProgramData -Force | Out-Null }
     Set-Content -Path $adminKeys -Value $pubKeys -Force
@@ -189,7 +316,7 @@ try {
 Write-Host "[6/6] 重启 sshd 服务..." -ForegroundColor Yellow
 try {
     Stop-Service sshd -Force -ErrorAction SilentlyContinue
-    Start-Service sshd
+    Start-Service sshd -ErrorAction Stop
     Set-Service -Name sshd -StartupType Automatic
     $sshdStatus = (Get-Service sshd).Status
     if ($sshdStatus -eq "Running") {
@@ -198,8 +325,31 @@ try {
         Write-Host "  [警告] sshd 状态: $sshdStatus" -ForegroundColor Red
     }
 } catch {
-    Write-Host "  [错误] 重启 sshd 失败: $_" -ForegroundColor Red
-    Write-Host "  尝试手动启动: Start-Service sshd" -ForegroundColor Yellow
+    Write-Host "  [错误] 启动 sshd 失败: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "  [失败] sshd 服务无法启动" -ForegroundColor Red
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "  请把以上信息截图发回" -ForegroundColor Yellow
+    Write-Host ""
+    pause
+    exit 1
+}
+
+# ============================================================
+# 最终验证: 确认 sshd 真的在跑
+# ============================================================
+$finalCheck = Get-Service sshd -ErrorAction SilentlyContinue
+if (-not $finalCheck -or $finalCheck.Status -ne "Running") {
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "  [失败] sshd 没有在运行!" -ForegroundColor Red
+    Write-Host "  状态: $(if ($finalCheck) { $finalCheck.Status } else { '服务不存在' })" -ForegroundColor Red
+    Write-Host "========================================" -ForegroundColor Red
+    Write-Host "  请把以上信息截图发回" -ForegroundColor Yellow
+    Write-Host ""
+    pause
+    exit 1
 }
 
 # ============================================================
